@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -937,6 +938,9 @@ async def _baseline_llm_caller(
         # without a parallel migration. The pre-built ``client`` is
         # passed through so the module-level Langfuse-wrapped client
         # keeps its HTTP connection pool warm across turns.
+        _local_llm_t0 = time.perf_counter()
+        logger.info("[LOCAL TIMING] before call_provider_stream")
+
         response = await call_provider_stream(
             client=client,
             model=state.model,
@@ -952,14 +956,29 @@ async def _baseline_llm_caller(
             tools=cast(list[dict[str, Any]] | None, list(tools)) if tools else None,
             max_tokens=max_tokens_arg,
         )
-        tool_calls_by_index: dict[int, dict[str, str]] = {}
 
+        logger.info(
+            "[LOCAL TIMING] call_provider_stream returned after %.3fs",
+            time.perf_counter() - _local_llm_t0,
+        )
+        tool_calls_by_index: dict[int, dict[str, str]] = {}
         # Iterate under an inner try/finally so early exits (cancel, tool-call
         # break, exception) always release the underlying httpx connection.
         # Without this, openai.AsyncStream leaks the streaming response and
         # the TCP socket ends up in CLOSE_WAIT until the process exits.
+        _local_first_chunk = True
         try:
-            async for chunk in response:
+           async for chunk in response:
+                if _local_first_chunk:
+                    logger.info(
+                        "[LOCAL TIMING] first stream chunk after %.3fs",
+                        time.perf_counter() - _local_llm_t0,
+                    )
+                    _local_first_chunk = False
+                logger.info(
+                "[LOCAL TIMING] first stream chunk after %.3fs",
+                 time.perf_counter() - _local_llm_t0,
+                )
                 if chunk.usage:
                     state.turn_prompt_tokens += chunk.usage.prompt_tokens or 0
                     state.turn_completion_tokens += chunk.usage.completion_tokens or 0
@@ -1965,9 +1984,20 @@ async def stream_chat_completion_baseline(
     # the ~20KB guide warm for the whole session.  Empty string for
     # non-builder sessions keeps the cross-user cache hot.
     builder_session_suffix = await build_builder_system_prompt_suffix(session)
+    if config.effective_transport == "local":
+        base_system_prompt = """You are Otto, the AI assistant on the AutoGPT platform.
+
+ Follow the user's request directly and concisely.
+ Use only tools actually provided to you.
+ Do not invent or reference unavailable tools, skills, agents, or capabilities.
+ If no tool is needed, answer the user directly.
+ """
+    shared_tool_notes = (
+        "" if config.effective_transport == "local" else SHARED_TOOL_NOTES
+    )
     system_prompt = (
         base_system_prompt
-        + SHARED_TOOL_NOTES
+        + shared_tool_notes
         + delegation_supplement
         + oversight_supplement
         + team_building_supplement
@@ -2055,14 +2085,16 @@ async def stream_chat_completion_baseline(
         # Skill index — same content/contract as the SDK path.  Failures
         # here MUST NOT block the turn; log and proceed with empty index.
         skills_ctx = ""
-        try:
-            skills_ctx = await build_skills_context(
-                user_id, expert_id=session.expert_id
-            )
-        except Exception:
-            logger.exception(
-                "[skills] failed to build skills_ctx — proceeding without it"
-            )
+        
+        if config.effective_transport != "local":
+            try:
+                skills_ctx = await build_skills_context(
+                    user_id, expert_id=session.expert_id
+                )
+            except Exception:
+                logger.exception(
+                    "[skills] failed to build skills_ctx — proceeding without it"
+                )
         prefixed = await inject_user_context(
             understanding,
             message or "",
@@ -2176,7 +2208,11 @@ async def stream_chat_completion_baseline(
     # session-start baseline the next turn diffs against. On the first
     # turn ``inject_user_context`` just wrote a fresh index into history,
     # so the diff is empty by construction and this is a no-op.
-    if is_user_message and user_id:
+    if (
+        config.effective_transport != "local"
+        and is_user_message
+        and user_id
+    ):
         try:
             skills_notice = await build_skills_update_notice(
                 user_id,
@@ -2288,9 +2324,13 @@ async def stream_chat_completion_baseline(
         disabled_groups=disabled_tool_groups, disabled_tools=disabled_tools
     )
 
-    # --- Permission filtering ---
+        # --- Permission filtering ---
     if permissions is not None:
         tools = _filter_tools_by_permissions(tools, permissions)
+
+    # Local-LLM experiment: no tool schemas for CPU-hosted models.
+    if config.effective_transport == "local":
+       tools = []
 
     # run_capability reaches deferred tools by id; bound it with the same
     # hidden set that shaped the schema list above.

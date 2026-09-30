@@ -34,6 +34,7 @@ import asyncio
 import functools
 import json as json_module
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Literal, cast
 
@@ -1030,7 +1031,24 @@ async def call_provider_stream(
         create_kwargs["stream_options"] = stream_options
     if tools:
         create_kwargs["tools"] = cast(list[ChatCompletionToolParam], list(tools))
-    return await client.chat.completions.create(**create_kwargs)
+    logger.info(
+        "[PROVIDER CLIENT] type=%s module=%s base_url=%s",
+        type(client).__name__,
+        type(client).__module__,
+        getattr(client, "base_url", None),
+    )
+
+    _provider_t0 = time.perf_counter()
+    logger.info("[PROVIDER TIMING] before client.chat.completions.create")
+
+    response = await client.chat.completions.create(**create_kwargs)
+
+    logger.info(
+        "[PROVIDER TIMING] client.chat.completions.create returned after %.3fs",
+        time.perf_counter() - _provider_t0,
+    )
+
+    return response
 
 
 async def call_provider_openai_compat_sync(

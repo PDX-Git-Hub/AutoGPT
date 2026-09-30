@@ -192,7 +192,7 @@ async def build_builder_system_prompt_suffix(
         f"<building_guide>\n{_BUILDING_GUIDE_PREAMBLE}\n\n{guide}\n</building_guide>"
     )
     if not is_builder:
-        return f"\n\n{guide_block}"
+        return ""
     return (
         f"\n\n<{BUILDER_SESSION_TAG}>\n"
         f"<tool_usage>\n"
